@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# phoneview — pair, connect, and mirror Android wirelessly via adb + scrcpy
+set -euo pipefail
+
+SUBNET_BASE="192.168.1"     # default LAN base (use --subnet to change)
+SCRCPY_SIZE="1280"          # --max-size
+SCRCPY_BITRATE="8M"         # --bitrate
+VIEW_MODE="--no-control"    # view-only by default
+NO_PAIR=0
+CONNECT_PORT=""
+PAIR_PORT=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <last-octet> <pairing-pin> [options]
+
+Examples:
+  $(basename "$0") 54 345654
+  $(basename "$0") 54 345654 --control --size 1920 --bitrate 16M
+
+Options:
+  --control               Allow keyboard/mouse control (default: view-only)
+  --size <px>             scrcpy max dimension (default: 1280)
+  --bitrate <rate>        scrcpy bitrate (default: 8M)
+  --subnet <a.b.c>        Base subnet (default: 192.168.1)
+  --no-pair               Skip pairing (connect only)
+  --connect-port <port>   Force adb connect port (default: mdns/5555)
+  --pair-port <port>      Force adb pairing port (rare)
+
+Help:
+  -h, --help              Show this help
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing '$1'. Install it first."; exit 1; }; }
+
+# Help early
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; exit 0; fi
+if [[ $# -lt 2 ]]; then usage; exit 1; fi
+
+LAST_OCTET="$1"; shift
+PAIR_PIN="$1"; shift
+
+# Parse opts
+while [[ $# -gt 0 ]]; do
+  case "${1:-}" in
+    --control) VIEW_MODE=""; shift;;
+    --size) SCRCPY_SIZE="${2:-}"; shift 2;;
+    --bitrate) SCRCPY_BITRATE="${2:-}"; shift 2;;
+    --subnet) SUBNET_BASE="${2:-}"; shift 2;;
+    --no-pair) NO_PAIR=1; shift;;
+    --connect-port) CONNECT_PORT="${2:-}"; shift 2;;
+    --pair-port) PAIR_PORT="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown option: $1"; usage; exit 1;;
+  esac
+done
+
+IP="${SUBNET_BASE}.${LAST_OCTET}"
+
+need adb
+need scrcpy
+adb start-server >/dev/null 2>&1 || true
+
+echo ">> Target IP: ${IP}"
+
+# mdns discovery helper
+discover_port() {
+  local ip="$1" kind="$2"      # kind: pairing|connect
+  local pattern="_adb-tls-${kind}._tcp"
+  adb mdns services 2>/dev/null | awk -v ip="$ip" -v pat="$pattern" '
+    $0 ~ ip && $0 ~ pat {
+      split($1, a, ":"); if (a[2] ~ /^[0-9]+$/) { print a[2]; exit }
+    }'
+}
+
+# --- Pair (unless skipped) ---
+if [[ "$NO_PAIR" -eq 0 ]]; then
+  if [[ -z "$PAIR_PORT" ]]; then
+    PAIR_PORT="$(discover_port "$IP" "pairing" || true)"
+  fi
+  if [[ -z "$PAIR_PORT" ]]; then
+    read -rp ">> Could not auto-discover PAIRING PORT for ${IP}. Enter port shown on phone: " PAIR_PORT
+  fi
+  echo ">> Pairing with ${IP}:${PAIR_PORT}"
+  if ! echo "$PAIR_PIN" | adb pair "${IP}:${PAIR_PORT}"; then
+    echo "!! Pairing failed. If already paired, re-run with --no-pair"
+    exit 1
+  fi
+else
+  echo ">> Skipping pairing (--no-pair)"
+fi
+
+# --- Connect ---
+if [[ -z "$CONNECT_PORT" ]]; then
+  CONNECT_PORT="$(discover_port "$IP" "connect" || true)"
+fi
+[[ -z "$CONNECT_PORT" ]] && CONNECT_PORT="5555"
+
+echo ">> Connecting to ${IP}:${CONNECT_PORT}"
+if ! adb connect "${IP}:${CONNECT_PORT}" >/dev/null; then
+  echo "!! Connect failed. Tips:"
+  echo "   - adb disconnect"
+  echo "   - adb mdns services"
+  echo "   - ensure Wireless debugging is ON and same Wi-Fi"
+  exit 1
+fi
+
+# --- Mirror ---
+echo ">> Launching scrcpy (${VIEW_MODE:-control}, size=${SCRCPY_SIZE}, bitrate=${SCRCPY_BITRATE})"
+exec scrcpy ${VIEW_MODE} --max-size="${SCRCPY_SIZE}" --bitrate="${SCRCPY_BITRATE}" --stay-awake
